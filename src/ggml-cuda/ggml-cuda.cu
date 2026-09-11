@@ -78,11 +78,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <chrono>
 #include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -566,6 +568,52 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         }
     }
 
+    // The CUDA VMM pool-growth driver calls (cuMemCreate / cuMemMap /
+    // cuMemSetAccess) are synchronous, but on Windows the NVIDIA driver can
+    // transiently return CUDA_ERROR_NOT_READY (600) while the GPU is still
+    // draining asynchronous work enqueued by the previous stage (e.g. the
+    // diffusion sampling kernels finishing right before a VAE decode
+    // allocates its compute buffer).  This is a known transient driver-side
+    // condition, not a sticky error: synchronizing the context so all prior
+    // work completes, then retrying the very same call, succeeds.  Without
+    // the retry the whole process aborts through GGML_ABORT.  Upstream
+    // llama.cpp carries an equivalent retry for the same class of failures.
+    template <typename F>
+    static void vmm_check_retry(F&& call, const char * stmt, const char * func, const char * file, int line) {
+        auto error_str = [](CUresult err) -> const char * {
+            const char * err_str = nullptr;
+            if (cuGetErrorString(err, &err_str) != CUDA_SUCCESS || err_str == nullptr) {
+                return "unknown CUresult";
+            }
+            return err_str;
+        };
+        const int max_attempts = 4;
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
+            const CUresult err = call();
+            if (err == CUDA_SUCCESS) {
+                return;
+            }
+            if (err != CUDA_ERROR_NOT_READY) {
+                // Not a transient condition: report through the fatal path.
+                ggml_cuda_error(stmt, func, file, line, error_str(err));
+                return;
+            }
+            GGML_LOG_WARN("CUDA VMM pool growth returned CUDA_ERROR_NOT_READY (transient); "
+                          "synchronizing device and retrying (attempt %d/%d)\n",
+                          attempt + 1, max_attempts);
+            // Let the GPU drain all in-flight asynchronous work first; this
+            // is what turns the driver's transient "device not ready" state
+            // back into a ready state.
+            cuCtxSynchronize();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        // Final attempt after the last backoff; report if it still fails.
+        const CUresult err = call();
+        if (err != CUDA_SUCCESS) {
+            ggml_cuda_error(stmt, func, file, line, error_str(err));
+        }
+    }
+
     void * alloc(size_t size, size_t * actual_size) override {
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
@@ -586,16 +634,19 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            vmm_check_retry([&]() { return cuMemCreate(&handle, reserve_size, &prop, 0); },
+                            "cuMemCreate(&handle, reserve_size, &prop, 0)", __func__, __FILE__, __LINE__);
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
-                CU_CHECK(cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0));
+                vmm_check_retry([&]() { return cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0); },
+                                "cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0)", __func__, __FILE__, __LINE__);
             }
 
             // map at the end of the pool
             CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
-            CU_CHECK(cuMemMap(start_ptr, reserve_size, 0, handle, 0));
+            vmm_check_retry([&]() { return cuMemMap(start_ptr, reserve_size, 0, handle, 0); },
+                            "cuMemMap(start_ptr, reserve_size, 0, handle, 0)", __func__, __FILE__, __LINE__);
 #if defined(GGML_USE_HIP)
             mappings.push_back({start_ptr, reserve_size});
 #endif
@@ -638,14 +689,16 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
                     access_descs.push_back(access);
                 }
-                CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size()));
+                vmm_check_retry([&]() { return cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size()); },
+                                "cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size())", __func__, __FILE__, __LINE__);
             } else {
                 // set access for non P2P
                 CUmemAccessDesc access = {};
                 access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
                 access.location.id = physical_device;
                 access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, &access, 1));
+                vmm_check_retry([&]() { return cuMemSetAccess(start_ptr, reserve_size, &access, 1); },
+                                "cuMemSetAccess(start_ptr, reserve_size, &access, 1)", __func__, __FILE__, __LINE__);
             }
 
             // add to the pool
@@ -1286,6 +1339,263 @@ static void * ggml_cuda_host_malloc(size_t size) {
     }
 
     return ptr;
+}
+
+// CUDA_PinnedOffload: host-pinned (or managed) RAM that CUDA kernels consume
+// directly (zero-copy), for the ComfyUI-style low-VRAM CPU-offload path.
+// - is_host=false so the CPU backend never claims the buffer; unsupported ops
+//   fail fast instead of silently running on CPU.
+// - get_max_size is capped (~2GB) so ggml-alloc splits large weight sets into
+//   several buffers, avoiding the Windows 10GB single-lock-page failure.
+// - alloc_size reuses the CUDA formula (quantized MATRIX_ROW_PADDING padding).
+
+struct ggml_backend_cuda_pinned_context {
+    int    device;
+    void * ptr;
+    bool   is_managed;
+};
+
+struct ggml_backend_cuda_pinned_buffer_type_context {
+    int device;
+};
+
+static const char * ggml_backend_cuda_pinned_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return GGML_CUDA_NAME "_PinnedOffload";
+
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_buft_is_cuda_pinned(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_cuda_pinned_buffer_type_name;
+}
+
+// Thread-local: tracks whether the last allocation fell back to managed
+// memory so the buffer context can pick the matching free path.
+static thread_local bool ggml_backend_cuda_pinned_last_was_managed = false;
+
+static void * ggml_backend_cuda_pinned_alloc(size_t size, int device) {
+    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_cuda_pinned_last_was_managed = false;
+    void * ptr = nullptr;
+    cudaSetDevice(device);
+    cudaError_t err = cudaHostAlloc(&ptr, size, cudaHostAllocPortable | cudaHostAllocMapped);
+    if (err != cudaSuccess) {
+        // clear the error
+        (void)cudaGetLastError();
+        GGML_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s; falling back to managed memory\n", __func__,
+                      size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        err = cudaMallocManaged(&ptr, size);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            GGML_LOG_ERROR("%s: failed to allocate %.2f MiB of managed memory: %s\n", __func__,
+                           size / 1024.0 / 1024.0, cudaGetErrorString(err));
+            return nullptr;
+        }
+        ggml_backend_cuda_pinned_last_was_managed = true;
+    }
+
+    return ptr;
+}
+
+static void ggml_backend_cuda_pinned_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_cuda_pinned_context * ctx = (ggml_backend_cuda_pinned_context *)buffer->context;
+    if (ctx->is_managed) {
+        CUDA_CHECK(cudaFree(ctx->ptr));
+    } else {
+        CUDA_CHECK(cudaFreeHost(ctx->ptr));
+    }
+    delete ctx;
+}
+
+static void * ggml_backend_cuda_pinned_buffer_get_base(ggml_backend_buffer_t buffer) {
+    ggml_backend_cuda_pinned_context * ctx = (ggml_backend_cuda_pinned_context *)buffer->context;
+    return ctx->ptr;
+}
+
+static enum ggml_status ggml_backend_cuda_pinned_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    ggml_backend_cuda_pinned_context * ctx = (ggml_backend_cuda_pinned_context *)buffer->context;
+
+    if (tensor->view_src != NULL) {
+        assert(tensor->view_src->buffer->buft == buffer->buft);
+        return GGML_STATUS_SUCCESS;
+    }
+
+    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        // initialize padding to 0 to avoid possible NaN values
+        const size_t original_size = ggml_nbytes(tensor);
+        const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+
+        if (padded_size > original_size) {
+            ggml_cuda_set_device(ctx->device);
+            CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_backend_cuda_pinned_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    memset((char *)tensor->data + offset, value, size);
+}
+
+static void ggml_backend_cuda_pinned_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    memcpy((char *)tensor->data + offset, data, size);
+}
+
+static void ggml_backend_cuda_pinned_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    memcpy(data, (const char *)tensor->data + offset, size);
+}
+
+static void ggml_backend_cuda_pinned_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    for (size_t i = 0; i < n_copies; i++) {
+        memcpy((char *)tensor->data + offset + i * stride_tensor, (const char *)data + i * stride_data, size);
+    }
+}
+
+static void ggml_backend_cuda_pinned_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    for (size_t i = 0; i < n_copies; i++) {
+        memcpy((char *)data + i * stride_data, (const char *)tensor->data + offset + i * stride_tensor, size);
+    }
+}
+
+static bool ggml_backend_cuda_pinned_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    if (src->buffer && src->buffer->buft && ggml_backend_buft_is_cuda_pinned(src->buffer->buft)) {
+        ggml_backend_cuda_pinned_context * src_ctx = (ggml_backend_cuda_pinned_context *)src->buffer->context;
+        ggml_backend_cuda_pinned_context * dst_ctx = (ggml_backend_cuda_pinned_context *)dst->buffer->context;
+        // compare the backing physical devices: distinct virtual devices may share one physical GPU,
+        // in which case a same-device copy (not a peer copy) is required
+        const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
+        const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
+        if (src_physical == dst_physical) {
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        } else {
+#ifdef GGML_CUDA_NO_PEER_COPY
+            return false;
+#else
+            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
+#endif
+        }
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        return true;
+    }
+    return false;
+
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_cuda_pinned_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    ggml_backend_cuda_pinned_context * ctx = (ggml_backend_cuda_pinned_context *)buffer->context;
+    memset(ctx->ptr, value, buffer->size);
+}
+
+static const ggml_backend_buffer_i ggml_backend_cuda_pinned_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_cuda_pinned_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cuda_pinned_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_cuda_pinned_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_cuda_pinned_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cuda_pinned_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cuda_pinned_buffer_get_tensor,
+    /* .set_tensor_2d   = */ ggml_backend_cuda_pinned_buffer_set_tensor_2d,
+    /* .get_tensor_2d   = */ ggml_backend_cuda_pinned_buffer_get_tensor_2d,
+    /* .cpy_tensor      = */ ggml_backend_cuda_pinned_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cuda_pinned_buffer_clear,
+};
+
+static ggml_backend_buffer_t ggml_backend_cuda_pinned_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_pinned_context * buft_ctx = (ggml_backend_cuda_pinned_context *)buft->context;
+
+    void * ptr = ggml_backend_cuda_pinned_alloc(size, buft_ctx->device);
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_cuda_pinned_context * ctx = new ggml_backend_cuda_pinned_context{
+        buft_ctx->device, ptr, ggml_backend_cuda_pinned_last_was_managed,
+    };
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_pinned_buffer_interface, ctx, size);
+}
+
+static size_t ggml_backend_cuda_pinned_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    return 128;
+
+    GGML_UNUSED(buft);
+}
+
+static size_t ggml_backend_cuda_pinned_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    // Cap per-buffer size so ggml-alloc splits big param sets into multiple
+    // pinned buffers. Single >10GB pinned allocations fail on Windows with
+    // limited lockable RAM. 2GB gives the best pinned-success / managed-fallback
+    // ratio on 16 GB RAM (only 2 of 6 chunks fall back to managed).
+    return 2ULL * 1024ULL * 1024ULL * 1024ULL; // 2GB
+
+    GGML_UNUSED(buft);
+}
+
+static size_t ggml_backend_cuda_pinned_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    size_t size = ggml_nbytes(tensor);
+    int64_t ne0 = tensor->ne[0];
+
+    if (ggml_is_quantized(tensor->type)) {
+        if (ne0 % MATRIX_ROW_PADDING != 0) {
+            GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
+            size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
+        }
+    }
+
+    return size;
+
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_cuda_pinned_buffer_is_host(ggml_backend_buffer_type_t buft) {
+    // Tell the model loader that tensors in pinned/managed buffers can be
+    // written directly from disk (memcpy into the host-accessible pointer),
+    // bypassing the serialised ggml_backend_tensor_set path.  This lets all
+    // 8 loader threads write in parallel instead of being serialised by
+    // backend_tensor_set_mutex, which was the dominant bottleneck.
+    return true;
+
+    GGML_UNUSED(buft);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_pinned_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_cuda_pinned_buffer_type_name,
+    /* .alloc_buffer     = */ ggml_backend_cuda_pinned_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_cuda_pinned_buffer_type_get_alignment,
+    /* .get_max_size     = */ ggml_backend_cuda_pinned_buffer_type_get_max_size,
+    /* .get_alloc_size   = */ ggml_backend_cuda_pinned_buffer_type_get_alloc_size,
+    /* .is_host          = */ ggml_backend_cuda_pinned_buffer_is_host,
+};
+
+ggml_backend_buffer_type_t ggml_backend_cuda_pinned_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type ggml_backend_cuda_pinned_buffer_types[GGML_CUDA_MAX_DEVICES];
+
+    static bool ggml_backend_cuda_pinned_buffer_type_initialized = false;
+
+    if (!ggml_backend_cuda_pinned_buffer_type_initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_cuda_pinned_buffer_types[i] = {
+                /* .iface    = */ ggml_backend_cuda_pinned_buffer_type_interface,
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ new ggml_backend_cuda_pinned_buffer_type_context{i},
+            };
+        }
+        ggml_backend_cuda_pinned_buffer_type_initialized = true;
+    }
+
+    return &ggml_backend_cuda_pinned_buffer_types[device];
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -4471,13 +4781,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                 // node's output on the host-visible buffer, which the compute path
                 // handles. Allow that here, mirroring the src-tensor check below.
+                // Host-pinned offload buffers (CUDA_PinnedOffload) are also valid
+                // sources: kernels consume them zero-copy.
                 assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                       (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
+                       (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)) ||
+                       ggml_backend_buft_is_cuda_pinned(node->buffer->buft));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)) ||
+                               ggml_backend_buft_is_cuda_pinned(node->src[j]->buffer->buft));
                     }
                 }
 #else
@@ -5180,6 +5494,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return false;
             }
         }
+        // host-pinned offload weights live on this device's pinned/zero-copy
+        // memory; they are valid sources for CUDA compute.
+        if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda_pinned(op->src[i]->buffer->buft)) {
+            ggml_backend_cuda_pinned_buffer_type_context * buft_ctx = (ggml_backend_cuda_pinned_buffer_type_context *)op->src[i]->buffer->buft->context;
+            if (buft_ctx->device != dev_ctx->device) {
+                return false;
+            }
+        }
     }
 
     switch (op->op) {
@@ -5666,7 +5988,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) ||
+           (ggml_backend_buft_is_cuda_pinned(buft) && buft->device == dev) ||
+           (integrated && ggml_backend_buft_is_cuda_host(buft));
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
