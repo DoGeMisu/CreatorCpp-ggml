@@ -1394,6 +1394,30 @@ static void * ggml_backend_cuda_pinned_alloc(size_t size, int device) {
                            size / 1024.0 / 1024.0, cudaGetErrorString(err));
             return nullptr;
         }
+        // Managed fallback optimization: set page placement policy so that
+        // weight pages stay on CPU (no migration to VRAM) and the GPU can
+        // read them via PCIe zero-copy.  We do NOT cudaMemPrefetchAsync here
+        // because forcing all ~2 GiB pages resident at once exhausts 16 GiB
+        // RAM (DiT 9.3 GiB + TE 7.4 GiB > physical memory), causing OOM and
+        // CUDA context corruption ("invalid device ordinal").  Pages are
+        // faulted in on first GPU access; with SetPreferredLocation=CPU the
+        // fault handler allocates on the CPU side (not VRAM), and
+        // SetAccessedBy=GPU enables direct UVA reads without migration.
+        if (device >= 0) {
+            cudaError_t advErr;
+            advErr = cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+            if (advErr != cudaSuccess) {
+                (void)cudaGetLastError();
+                GGML_LOG_WARN("%s: cudaMemAdvise(SetPreferredLocation) failed: %s (continuing)\n",
+                              __func__, cudaGetErrorString(advErr));
+            }
+            advErr = cudaMemAdvise(ptr, size, cudaMemAdviseSetAccessedBy, device);
+            if (advErr != cudaSuccess) {
+                (void)cudaGetLastError();
+                GGML_LOG_WARN("%s: cudaMemAdvise(SetAccessedBy) failed: %s (continuing)\n",
+                              __func__, cudaGetErrorString(advErr));
+            }
+        }
         ggml_backend_cuda_pinned_last_was_managed = true;
     }
 
